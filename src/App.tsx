@@ -345,7 +345,7 @@ export function App() {
     return () => window.removeEventListener("keydown", handler, true);
   }, []);
 
-  const { sessions, agents, eventLog, addEvent, handleMessage, feedEvents, feedActive, agentFeedLog, teams } = useSessions();
+  const { sessions, agents, eventLog, addEvent, handleMessage, feedEvents, feedActive, agentFeedLog, teams, looseAgents } = useSessions();
 
   // Source filter: all / local / remote (synced via CustomEvent from FloatingButtons)
   const [sourceFilter, setSourceFilter] = useState<"all" | "local" | "remote">(() => (localStorage.getItem("office-source-filter") as any) || "all");
@@ -496,7 +496,7 @@ export function App() {
   if (route === "fleet") {
     return (
       <Layout activeView="fleet" {...layoutProps} statusBarChildren={<FleetControls agents={filteredAgents} send={send} />}>
-        <FleetGrid sessions={filteredSessions} agents={filteredAgents} connected={connected} send={send} onSelectAgent={onSelectAgent} eventLog={eventLog} addEvent={addEvent} feedActive={feedActive} agentFeedLog={agentFeedLog} teams={teams} />
+        <FleetGrid sessions={filteredSessions} agents={filteredAgents} connected={connected} send={send} onSelectAgent={onSelectAgent} eventLog={eventLog} addEvent={addEvent} feedActive={feedActive} agentFeedLog={agentFeedLog} teams={teams} looseAgents={looseAgents} />
       </Layout>
     );
   }

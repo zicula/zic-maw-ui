@@ -176,6 +176,7 @@ interface FleetGridProps {
   feedActive?: Map<string, FeedEvent>;
   agentFeedLog?: Map<string, FeedEvent[]>;
   teams?: Team[];
+  looseAgents?: AgentState[];
 }
 
 /** Track visible agent targets via IntersectionObserver */
@@ -251,7 +252,7 @@ function sortRooms(sessions: Session[], agentMap: Map<string, AgentState[]>, mod
 }
 
 export const FleetGrid = memo(function FleetGrid({
-  sessions, agents, connected, send, onSelectAgent, eventLog, addEvent, feedActive, agentFeedLog, teams,
+  sessions, agents, connected, send, onSelectAgent, eventLog, addEvent, feedActive, agentFeedLog, teams, looseAgents,
 }: FleetGridProps) {
   const fps = useFps();
   const observe = useVisibleTargets(send);
@@ -483,6 +484,36 @@ export const FleetGrid = memo(function FleetGrid({
             </div>
           )}
         </section>
+
+        {/* External Agents — surfaced from server snapshots, no tmux pane. */}
+        {looseAgents && looseAgents.length > 0 && (
+          <section className="rounded-2xl overflow-hidden" style={{ background: "#12121c", border: "1px solid rgba(167,139,250,0.15)", boxShadow: "0 2px 8px rgba(0,0,0,0.3)" }}>
+            <div className="flex items-center gap-5 px-6 py-4 cursor-pointer select-none" style={{ background: "rgba(167,139,250,0.03)" }}
+              onClick={() => toggleCollapsed("_external")} role="button" tabIndex={0}
+              onKeyDown={(e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); toggleCollapsed("_external"); } }}>
+              <div className="w-3 h-3 rounded-full flex-shrink-0" style={{ background: "#a78bfa", boxShadow: "0 0 6px #a78bfa" }} />
+              <h3 className="text-base font-bold tracking-[4px] uppercase" style={{ color: "#a78bfa" }}>External Agents</h3>
+              <span className="text-xs font-mono font-bold px-2.5 py-1 rounded-md" style={{ background: "rgba(167,139,250,0.15)", color: "#a78bfa" }}>{looseAgents.length}</span>
+              <svg width={16} height={16} viewBox="0 0 16 16" fill="none" className="ml-auto flex-shrink-0 transition-transform duration-200"
+                style={{ transform: isCollapsed("_external") ? "rotate(-90deg)" : "rotate(0deg)" }}>
+                <path d="M4 6l4 4 4-4" stroke="#a78bfa" strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round" opacity={0.5} />
+              </svg>
+            </div>
+            {!isCollapsed("_external") && <div className="h-[1px]" style={{ background: "rgba(167,139,250,0.12)" }} />}
+            {!isCollapsed("_external") && (
+              <div className="flex flex-col">
+                {looseAgents.map((agent, i) => (
+                  <AgentRow key={`ext-${agent.target}`} agent={agent} accent="#a78bfa" roomLabel="EXTERNAL"
+                    isLast={i === looseAgents.length - 1}
+                    featured={false} feedLog={getAgentFeedLog(agent.name)}
+                    slept={false} alignWidth={96}
+                    observe={observe} showPreview={showPreview} hidePreview={hidePreview} onAgentClick={onAgentClick}
+                    send={send} onSendDone={onSendDone} teams={teams} />
+                ))}
+              </div>
+            )}
+          </section>
+        )}
 
         {/* Room cards */}
         {visualRooms.map((vr) => {
