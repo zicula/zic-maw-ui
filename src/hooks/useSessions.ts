@@ -9,6 +9,7 @@ import { useFleetStore } from "../lib/store";
 import { useFeedStatusStore } from "../lib/feedStatusStore";
 import { usePreviewStore } from "../lib/previewStore";
 import { matchAgentToEvent } from "../lib/resolveAgent";
+import { classifyNotification } from "../lib/classifyNotification";
 import { activeOracles, type FeedEvent, type FeedEventType } from "../lib/feed";
 import type { AskType } from "../lib/types";
 
@@ -158,11 +159,7 @@ export function useSessions() {
     }
 
     if (event.event === "Notification") {
-      const msg = event.message.toLowerCase();
-      let askType: AskType | null = null;
-      if (msg.includes("waiting for your input") || msg.includes("waiting for input")) askType = "input";
-      else if (msg.includes("needs your attention") || msg.includes("attention")) askType = "attention";
-      else if (msg.includes("needs your approval") || msg.includes("approval")) askType = "plan";
+      const askType = classifyNotification(event);
       if (askType) {
         let stopMsg = lastStopMessage.current[oracleName];
         if (!stopMsg) {

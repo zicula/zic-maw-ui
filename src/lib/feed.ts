@@ -35,6 +35,13 @@ export interface FeedEvent {
   sessionId: string;
   message: string;
   ts: number;
+  /** Event-specific payload. Notification carries the classifier the UI needs. */
+  data?: {
+    /** Closed enum from Claude Code: agent_needs_input, worker_permission_prompt, idle_prompt, … */
+    notificationType?: string;
+    title?: string;
+    [key: string]: unknown;
+  };
 }
 
 /**
