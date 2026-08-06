@@ -11,7 +11,7 @@ export interface Session {
   source?: string;  // peer URL or "local"
 }
 
-export type PaneStatus = "ready" | "busy" | "idle" | "crashed";
+export type PaneStatus = "ready" | "busy" | "idle" | "crashed" | "offline";
 
 export interface AgentState {
   target: string;
