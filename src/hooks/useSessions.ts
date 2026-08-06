@@ -8,6 +8,7 @@ import { playWakeSound } from "../lib/sounds";
 import { useFleetStore } from "../lib/store";
 import { useFeedStatusStore } from "../lib/feedStatusStore";
 import { usePreviewStore } from "../lib/previewStore";
+import { matchAgentToEvent } from "../lib/resolveAgent";
 import { activeOracles, type FeedEvent, type FeedEventType } from "../lib/feed";
 import type { AskType } from "../lib/types";
 
@@ -64,21 +65,11 @@ export function useSessions() {
   const FEED_BUSY_EVENTS = new Set<FeedEventType>(["PreToolUse", "PostToolUse", "UserPromptSubmit", "SubagentStart", "PostToolUseFailure"]);
   const FEED_STOP_EVENTS = new Set<FeedEventType>(["Stop", "SessionEnd", "TaskCompleted", "Notification"]);
 
-  /** Resolve feed event → agent. Uses project field for worktree-aware matching (case-insensitive).
-   *  KEY: worktree events NEVER fall back to main oracle window — prevents cross-contamination. */
+  /** Resolve feed event → tracked tmux agent via 3-strategy resolver.
+   *  KEY: worktree events NEVER fall back to main oracle window — prevents cross-contamination.
+   *  Also tries project fallback (event.project basename vs agent.project) for unnamed oracles. */
   const resolveAgentFromFeed = useCallback((event: FeedEvent): AgentState | undefined => {
-    const project = event.project;
-    const wtMatch = project.match(/[.-]wt-(?:\d+-)?(.+)$/);
-    if (wtMatch) {
-      const windowName = `${event.oracle}-${wtMatch[1]}`.toLowerCase();
-      // If worktree event but no matching window, return undefined — do NOT fall back to main
-      return agentsRef.current.find(a => a.name.toLowerCase() === windowName);
-    }
-    // Only non-worktree events match by oracle name (main window)
-    const oracleLower = event.oracle.toLowerCase();
-    const oracleMain = oracleLower.endsWith("-oracle") ? oracleLower : `${oracleLower}-oracle`;
-    return agentsRef.current.find(a => a.name.toLowerCase() === oracleMain)
-      || agentsRef.current.find(a => a.name.toLowerCase() === oracleLower);
+    return matchAgentToEvent(event, agentsRef.current);
   }, []);
 
   const updateStatusFromFeed = useCallback((event: FeedEvent) => {
@@ -201,6 +192,25 @@ export function useSessions() {
       if (json !== sessionsJsonRef.current) {
         sessionsJsonRef.current = json;
         setSessions(next);
+        // ponytail: orphan tmux windows (not registered as maw oracles via
+        // `maw wake`/`maw bud`) never receive feed events, so status stays
+        // "idle" forever — even though Claude/codex is actively running in
+        // the pane. Without this fix the office view shows those rooms as
+        // gray chibis. Stamp `ready` for any active window whose target
+        // isn't already busy/ready — the decay tick will still demote back
+        // to idle after IDLE_TIMEOUT if the pane really goes quiet.
+        const store = useFeedStatusStore.getState();
+        for (const s of next) {
+          for (const w of s.windows) {
+            if (!w.active) continue;
+            const target = `${s.name}:${w.index}`;
+            const current = store.statuses[target];
+            if (current !== "busy" && current !== "ready") {
+              store.setStatus(target, "ready");
+              feedLastSeen.current[target] = Date.now();
+            }
+          }
+        }
       }
     } else if (data.type === "recent") {
       const agents: { target: string; name: string; session: string }[] = data.agents || [];
@@ -262,12 +272,29 @@ export function useSessions() {
     } else if (data.type === "action-ok") {
       if (data.action === "sleep") markSlept(data.target);
       else if (data.action === "wake") clearSlept(data.target);
+    } else if (data.type === "agent.snapshot.list") {
+      // Server pushes authoritative snapshot list on connect — replace, don't merge
+      const snapshots = (data.snapshots as import("../lib/feedStatusStore").AgentSnapshot[]) || [];
+      useFeedStatusStore.getState().setAgentSnapshots(snapshots);
+    } else if (data.type === "agent.activity") {
+      const snap = data.snapshot as import("../lib/feedStatusStore").AgentSnapshot;
+      useFeedStatusStore.getState().setAgentSnapshot(snap);
+      // If this oracle maps to a tracked tmux agent, mirror status into the
+      // target-keyed map (and stamp lastSeen so decay doesn't demote it).
+      const tracked = matchAgentToEvent(snap, agentsRef.current);
+      if (tracked) {
+        useFeedStatusStore.getState().setStatus(tracked.target, snap.status);
+        feedLastSeen.current[tracked.target] = Date.now();
+      }
+    } else if (data.type === "agent.snapshot.removed") {
+      useFeedStatusStore.getState().removeAgentSnapshot(data.oracle);
     }
   }, []);
 
   // Subscribe to statuses — agents re-derive on status change
   // Blink prevented by stable useCallback props (not by removing reactivity)
   const statuses = useFeedStatusStore((s) => s.statuses);
+  const agentSnapshots = useFeedStatusStore((s) => s.agentStatuses);
 
   const agents: AgentState[] = useMemo(() => {
     const list = sessions.flatMap((s) =>
@@ -300,6 +327,34 @@ export function useSessions() {
 
   const feedActive = useMemo(() => activeOracles(feedEvents, 5 * 60_000), [feedEvents]);
 
+  // External (no tmux pane) agents surfaced from server snapshot map. Skipped
+  // when the snapshot oracle already maps to a tracked tmux agent via
+  // matchAgentToEvent — those update the target-keyed map instead.
+  const looseAgents = useMemo((): AgentState[] => {
+    const external: AgentState[] = [];
+    for (const snap of Object.values(agentSnapshots)) {
+      const matched = matchAgentToEvent(snap, agents);
+      if (matched) continue;
+      const basename = snap.project?.includes("/")
+        ? snap.project.split("/").pop()!
+        : snap.project;
+      external.push({
+        target: `ext:${snap.oracle}`,
+        name: snap.oracle,
+        session: "external",
+        windowIndex: -1,
+        active: false,
+        preview: "",
+        status: snap.status,
+        project: basename || undefined,
+        cwd: snap.project,
+        source: "external",
+      });
+    }
+    external.sort((a, b) => agentSortKey(a.name) - agentSortKey(b.name));
+    return external;
+  }, [agents, agentSnapshots]);
+
   const agentFeedLog = useMemo((): Map<string, FeedEvent[]> => {
     const map = new Map<string, FeedEvent[]>();
     for (let i = feedEvents.length - 1; i >= 0; i--) {
@@ -312,5 +367,5 @@ export function useSessions() {
     return map;
   }, [feedEvents, resolveAgentFromFeed]);
 
-  return { sessions, agents, eventLog, addEvent, handleMessage, feedEvents, feedActive, agentFeedLog, teams };
+  return { sessions, agents, eventLog, addEvent, handleMessage, feedEvents, feedActive, agentFeedLog, teams, looseAgents };
 }

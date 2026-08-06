@@ -18,11 +18,12 @@ const STATUS: Record<PaneStatus, { color: string; bg: string; label: string }> =
   ready:   { color: "#4caf50", bg: "rgba(76,175,80,0.12)", label: "READY" },
   idle:    { color: "#666",    bg: "rgba(102,102,102,0.08)", label: "IDLE" },
   crashed: { color: "#ef4444", bg: "rgba(239,68,68,0.14)",   label: "CRASHED" },
+  offline: { color: "#3a3a3a", bg: "rgba(58,58,58,0.08)",   label: "OFFLINE" },
 };
 
 // ChibiPortrait only supports non-crashed states; fall back to idle.
 const chibiStatus = (s: PaneStatus): "busy" | "ready" | "idle" =>
-  s === "crashed" ? "idle" : s;
+  s === "crashed" || s === "offline" ? "idle" : s;
 
 // --- Agent Mini Card (touch-friendly 44px+ targets) ---
 function AgentCard({ agent, selected, onSelect }: { agent: AgentState; selected: boolean; onSelect: () => void }) {

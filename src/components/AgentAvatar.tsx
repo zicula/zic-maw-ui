@@ -8,6 +8,7 @@ const STATUS_FX: Record<PaneStatus, { color: string; aura: number; sparkle: bool
   busy:    { color: "#fdd835", aura: 2, sparkle: true,  typing: true  },
   idle:    { color: "#666",    aura: 0, sparkle: false, typing: false },
   crashed: { color: "#ef4444", aura: 0, sparkle: false, typing: false },
+  offline: { color: "#3a3a3a", aura: 0, sparkle: false, typing: false },
 };
 
 interface AgentAvatarProps {
