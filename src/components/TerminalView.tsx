@@ -1,17 +1,24 @@
-import { memo, useState, useEffect, useRef, useCallback } from "react";
+import { memo, useState, useEffect, useRef, useCallback, useMemo } from "react";
 import { ansiToHtml } from "../lib/ansi";
 import { roomStyle } from "../lib/constants";
-import { wsUrl } from "../lib/api";
+import { openWs } from "../lib/api";
 import type { Session, AgentState } from "../lib/types";
+import { uploadTerminalImage } from "../lib/terminalImageUpload";
+import { useDevice } from "../hooks/useDevice";
 
 interface TerminalViewProps {
   sessions: Session[];
   agents: AgentState[];
   connected: boolean;
   onSelectAgent: (agent: AgentState) => void;
+  initialTarget?: string | null;
 }
 
-export const TerminalView = memo(function TerminalView({ sessions, agents, connected, onSelectAgent }: TerminalViewProps) {
+export const TerminalView = memo(function TerminalView({ sessions, agents, connected, onSelectAgent, initialTarget }: TerminalViewProps) {
+  const { isNarrow } = useDevice();
+  const [drawerOpen, setDrawerOpen] = useState(false);
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState("");
   const [selectedTarget, setSelectedTarget] = useState<string | null>(null);
   const [captureHtml, setCaptureHtml] = useState("");
   const [inputBuf, setInputBuf] = useState("");
@@ -20,28 +27,42 @@ export const TerminalView = memo(function TerminalView({ sessions, agents, conne
   const outputRef = useRef<HTMLDivElement>(null);
   const termRef = useRef<HTMLDivElement>(null);
   const sendingRef = useRef(false);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [uploading, setUploading] = useState(false);
+  const [toast, setToast] = useState<{ msg: string; kind: "ok" | "warn" | "err" } | null>(null);
+  const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const showToast = useCallback((msg: string, kind: "ok" | "warn" | "err" = "ok") => {
+    setToast({ msg, kind });
+    if (toastTimer.current) clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 3500);
+  }, []);
 
   // Own WebSocket for capture stream (separate from main fleet WS)
   useEffect(() => {
-    const ws = new WebSocket(wsUrl("/ws"));
-    wsRef.current = ws;
+    let alive = true;
+    // Ticket minting is async, so the socket may not exist yet at cleanup time.
+    openWs("/ws").then(ws => {
+      if (!alive) { ws.close(); return; }
+      wsRef.current = ws;
 
-    ws.onmessage = (e) => {
-      try {
-        const data = JSON.parse(e.data);
-        if (data.type === "capture") {
-          const out = outputRef.current;
-          const atBottom = out ? out.scrollHeight - out.scrollTop - out.clientHeight < 60 : true;
-          setCaptureHtml(ansiToHtml(data.content || "(empty)"));
-          if (atBottom) requestAnimationFrame(() => out?.scrollTo(0, out.scrollHeight));
-        }
-      } catch {}
-    };
+      ws.onmessage = (e) => {
+        try {
+          const data = JSON.parse(e.data);
+          if (data.type === "capture") {
+            const out = outputRef.current;
+            const atBottom = out ? out.scrollHeight - out.scrollTop - out.clientHeight < 60 : true;
+            setCaptureHtml(ansiToHtml(data.content || "(empty)"));
+            if (atBottom) requestAnimationFrame(() => out?.scrollTo(0, out.scrollHeight));
+          }
+        } catch {}
+      };
 
-    ws.onclose = () => { wsRef.current = null; };
-    ws.onerror = () => ws.close();
+      ws.onclose = () => { wsRef.current = null; };
+      ws.onerror = () => ws.close();
+    }).catch(() => {});
 
-    return () => { ws.close(); wsRef.current = null; };
+    return () => { alive = false; wsRef.current?.close(); wsRef.current = null; };
   }, []);
 
   // Subscribe when target changes
@@ -69,8 +90,24 @@ export const TerminalView = memo(function TerminalView({ sessions, agents, conne
     setCaptureHtml("");
     setInputBuf("");
     setSendQueue([]);
+    setDrawerOpen(false);
     termRef.current?.focus();
   }, []);
+
+  useEffect(() => {
+    if (!isNarrow || selectedTarget) return;
+    const firstSession = sessions[0];
+    const firstWindow = firstSession?.windows[0];
+    if (firstWindow) selectWindow(`${firstSession.name}:${firstWindow.index}`);
+  }, [isNarrow, selectedTarget, sessions, selectWindow]);
+
+  useEffect(() => {
+    if (!initialTarget || initialTarget === selectedTarget) return;
+    const exists = sessions.some(session =>
+      session.windows.some(window => `${session.name}:${window.index}` === initialTarget)
+    );
+    if (exists) selectWindow(initialTarget);
+  }, [initialTarget, selectedTarget, sessions, selectWindow]);
 
   // Flush send queue
   useEffect(() => {
@@ -91,6 +128,35 @@ export const TerminalView = memo(function TerminalView({ sessions, agents, conne
     if (!text || !selectedTarget) return;
     setSendQueue(q => [...q, text]);
   }, [selectedTarget]);
+
+  // Display name for the selected target (also used by the attach handler).
+  const selectedName = selectedTarget
+    ? sessions.flatMap(s => s.windows.map(w => ({ target: `${s.name}:${w.index}`, name: w.name }))).find(w => w.target === selectedTarget)?.name || ""
+    : "";
+
+  // 📎 attach: upload an image to labubu-upload, then inject its saved path into
+  // the SELECTED Oracle session via the same queueSend path used for typing.
+  // maw only tracks claude panes as AgentState — no agent for a target ⇒ it's a
+  // bash/non-claude window, so we warn instead of injecting (path would run as a
+  // shell command and the image would never reach an Oracle's context).
+  const uploadAttachment = useCallback(async (file: File) => {
+    if (!selectedTarget) { showToast("เลือกหน้าต่างก่อนแนบภาพ", "warn"); return; }
+    const isClaudeWindow = agents.some(a => a.target === selectedTarget);
+    if (!isClaudeWindow) {
+      showToast(`"${selectedName || selectedTarget}" ไม่ใช่ Claude session — ไม่ได้ฉีดภาพ (เลือกหน้าต่าง Oracle)`, "warn");
+      return;
+    }
+    setUploading(true);
+    try {
+      const path = await uploadTerminalImage(file);
+      queueSend(`[ภาพแนบ — โปรดดู: ${path}]\n`);
+      showToast(`ส่งภาพไปที่ ${selectedName || selectedTarget} แล้ว`, "ok");
+    } catch (error) {
+      showToast(`อัปโหลดล้มเหลว: ${error instanceof Error ? error.message : "network"}`, "err");
+    } finally {
+      setUploading(false);
+    }
+  }, [selectedTarget, selectedName, agents, queueSend, showToast]);
 
   // Paste handler — fires on right-click paste or Ctrl+Shift+V
   const handlePaste = useCallback((e: React.ClipboardEvent) => {
@@ -151,15 +217,72 @@ export const TerminalView = memo(function TerminalView({ sessions, agents, conne
     }
   }, [selectedTarget, inputBuf, queueSend, selectWindow, sessions]);
 
-  // Get display name for selected target
-  const selectedName = selectedTarget
-    ? sessions.flatMap(s => s.windows.map(w => ({ target: `${s.name}:${w.index}`, name: w.name }))).find(w => w.target === selectedTarget)?.name || ""
-    : "";
+  const sendKey = useCallback((text: string) => {
+    const ws = wsRef.current;
+    if (ws?.readyState === WebSocket.OPEN && selectedTarget) {
+      ws.send(JSON.stringify({ type: "send", target: selectedTarget, text, force: true }));
+    }
+  }, [selectedTarget]);
+
+  const displayHtml = useMemo(() => {
+    const query = searchQuery.trim();
+    if (!query) return captureHtml;
+    const escaped = query.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return captureHtml.split(/(<[^>]*>)/).map(part =>
+      part.startsWith("<") ? part : part.replace(new RegExp(escaped, "gi"), match => `<mark style="background:#facc15;color:#111">${match}</mark>`)
+    ).join("");
+  }, [captureHtml, searchQuery]);
+
+  const copyOutput = useCallback(async () => {
+    const text = outputRef.current?.innerText || "";
+    if (!text) return;
+    await navigator.clipboard.writeText(text);
+    showToast("Copied terminal output");
+  }, [showToast]);
+
+  const captureScreenshot = useCallback(() => {
+    const text = outputRef.current?.innerText || "";
+    const lines = text.split("\n");
+    const canvas = document.createElement("canvas");
+    const context = canvas.getContext("2d");
+    if (!context) return;
+    canvas.width = Math.min(1600, Math.max(640, ...lines.map(line => line.length * 8 + 32)));
+    canvas.height = Math.max(120, lines.length * 18 + 32);
+    context.fillStyle = "#0a0a0f";
+    context.fillRect(0, 0, canvas.width, canvas.height);
+    context.fillStyle = "#d1d5db";
+    context.font = "13px monospace";
+    lines.forEach((line, index) => context.fillText(line, 16, 24 + index * 18));
+    canvas.toBlob(blob => {
+      if (!blob) return;
+      const link = document.createElement("a");
+      link.href = URL.createObjectURL(blob);
+      link.download = `terminal-${new Date().toISOString().slice(0, 19).replace(/:/g, "-")}.png`;
+      link.click();
+      URL.revokeObjectURL(link.href);
+    }, "image/png");
+  }, []);
 
   return (
-    <div className="flex mx-4 sm:mx-6 mb-3 rounded-2xl overflow-hidden border border-white/[0.06]" style={{ height: "calc(100vh - 72px)" }}>
+    <div className={`flex ${isNarrow ? "mx-0 mb-0" : "mx-4 sm:mx-6 mb-3 rounded-2xl"} overflow-hidden border border-white/[0.06]`} style={{ height: "calc(100vh - 72px)" }}>
+      {isNarrow && drawerOpen && (
+        <button
+          className="fixed inset-0 z-30 bg-black/60"
+          aria-label="Close terminal sessions"
+          onClick={() => setDrawerOpen(false)}
+        />
+      )}
       {/* Sidebar */}
-      <div className="w-[220px] flex-shrink-0 flex flex-col border-r border-white/[0.06] overflow-y-auto" style={{ background: "#08080e" }}>
+      <div
+        className={`${isNarrow ? `fixed inset-y-0 left-0 z-40 w-[min(82vw,320px)] transition-transform ${drawerOpen ? "translate-x-0" : "-translate-x-full"}` : "w-[220px]"} flex-shrink-0 flex flex-col border-r border-white/[0.06] overflow-y-auto`}
+        style={{ background: "#08080e" }}
+      >
+        {isNarrow && (
+          <div className="flex items-center justify-between px-4 py-3 border-b border-white/[0.06]">
+            <span className="text-xs font-mono text-white/50">terminal sessions</span>
+            <button className="text-xl text-white/50" onClick={() => setDrawerOpen(false)} aria-label="Close terminal sessions">×</button>
+          </div>
+        )}
         {sessions.map(session => {
           const style = roomStyle(session.name);
           return (
@@ -202,20 +325,52 @@ export const TerminalView = memo(function TerminalView({ sessions, agents, conne
       {/* Terminal pane */}
       <div
         ref={termRef}
-        className="flex-1 flex flex-col min-w-0 outline-none"
+        className="flex-1 flex flex-col min-w-0 outline-none relative"
         tabIndex={0}
         onKeyDown={handleKeyDown}
         onPaste={handlePaste}
         onClick={() => termRef.current?.focus()}
       >
+        {/* Attach toast — "sent to <target>" / warn / error */}
+        {toast && (
+          <div
+            className="absolute left-1/2 -translate-x-1/2 top-3 z-10 px-3 py-1.5 rounded-lg text-[12px] font-mono shadow-lg pointer-events-none"
+            style={{
+              background: toast.kind === "ok" ? "#1b3a2a" : toast.kind === "warn" ? "#3a341b" : "#3a1b1b",
+              color: toast.kind === "ok" ? "#7ee2a8" : toast.kind === "warn" ? "#e2cf7e" : "#e27e7e",
+              border: `1px solid ${toast.kind === "ok" ? "#2e6b4a" : toast.kind === "warn" ? "#6b5e2e" : "#6b2e2e"}`,
+            }}
+          >
+            {toast.kind === "ok" ? "✓ " : toast.kind === "warn" ? "⚠ " : "✕ "}{toast.msg}
+          </div>
+        )}
         {/* Header */}
         <div className="flex items-center gap-3 px-4 py-2 border-b border-white/[0.06] flex-shrink-0" style={{ background: "#0a0a12" }}>
+          {isNarrow && (
+            <button className="text-lg text-white/60" onClick={() => setDrawerOpen(true)} aria-label="Open terminal sessions">☰</button>
+          )}
           <span className="text-xs font-mono text-white/40">{selectedName || "select a window"}</span>
           {selectedTarget && <span className="text-[10px] font-mono text-white/20">{selectedTarget}</span>}
           <span className="ml-auto text-[10px] font-mono" style={{ color: connected ? "#4caf50" : "#ef5350" }}>
             {connected ? "live" : "reconnecting"}
           </span>
+          {isNarrow && <button className="text-sm text-white/50" onClick={() => setSearchOpen(value => !value)} aria-label="Search terminal output">⌕</button>}
+          {isNarrow && <button className="text-sm text-white/50" onClick={copyOutput} aria-label="Copy terminal output">⧉</button>}
+          {isNarrow && <button className="text-sm text-white/50" onClick={captureScreenshot} aria-label="Screenshot terminal output">▣</button>}
         </div>
+
+        {isNarrow && searchOpen && (
+          <div className="flex gap-2 border-b border-white/[0.06] p-2">
+            <input
+              aria-label="Search terminal output"
+              className="min-w-0 flex-1 rounded bg-white/[0.06] px-3 py-1 text-sm text-white outline-none"
+              value={searchQuery}
+              onChange={event => setSearchQuery(event.target.value)}
+              placeholder="Find in output"
+            />
+            <button className="text-white/50" onClick={() => { setSearchOpen(false); setSearchQuery(""); }}>×</button>
+          </div>
+        )}
 
         {/* Output */}
         <div
@@ -224,7 +379,7 @@ export const TerminalView = memo(function TerminalView({ sessions, agents, conne
           style={{ background: "#0a0a0f", whiteSpace: "pre", wordBreak: "normal", overflowX: "auto", color: "#aaa" }}
         >
           {captureHtml ? (
-            <div dangerouslySetInnerHTML={{ __html: captureHtml }} />
+            <div dangerouslySetInnerHTML={{ __html: displayHtml }} />
           ) : (
             <div className="text-white/15 text-center mt-[30vh] text-sm">
               {selectedTarget ? "connecting..." : "select a window \u2190"}
@@ -233,10 +388,66 @@ export const TerminalView = memo(function TerminalView({ sessions, agents, conne
         </div>
 
         {/* Input line */}
+        {isNarrow && (
+          <div aria-label="Terminal assist keys" className="flex gap-1 overflow-x-auto border-t border-white/[0.06] p-1.5">
+            {[["Tab", "\t"], ["Esc", "\x1b"], ["^C", "\x03"], ["^D", "\x04"], ["↑", "\x1b[A"], ["↓", "\x1b[B"], ["←", "\x1b[D"], ["→", "\x1b[C"]].map(([label, value]) => (
+              <button key={label} className="min-w-10 rounded bg-white/[0.06] px-2 py-1.5 font-mono text-xs text-white/60" onClick={() => sendKey(value)}>{label}</button>
+            ))}
+          </div>
+        )}
+        {isNarrow && (
+          <div className="flex items-end gap-2 p-2 border-t border-white/[0.06]" style={{ background: "#0d0d14" }}>
+            <textarea
+              aria-label="Terminal input"
+              value={inputBuf}
+              disabled={!selectedTarget}
+              rows={1}
+              onChange={event => setInputBuf(event.target.value)}
+              onKeyDown={event => {
+                event.stopPropagation();
+                if (event.key === "Enter" && !event.shiftKey) {
+                  event.preventDefault();
+                  if (inputBuf) { queueSend(inputBuf); setInputBuf(""); }
+                }
+              }}
+              className="min-h-10 max-h-28 flex-1 resize-none rounded-lg bg-white/[0.05] px-3 py-2 font-mono text-sm text-white outline-none disabled:opacity-40"
+              placeholder={selectedTarget ? "Type a command…" : "Select a session"}
+            />
+            <button
+              className="h-10 rounded-lg bg-blue-500/20 px-4 text-sm text-blue-200 disabled:opacity-30"
+              disabled={!selectedTarget || !inputBuf}
+              onClick={() => { if (inputBuf) { queueSend(inputBuf); setInputBuf(""); } }}
+            >Send</button>
+          </div>
+        )}
         <div
-          className="flex items-start px-3 py-1.5 border-t border-white/[0.06] font-mono text-[13px] min-h-[32px]"
+          className={`${isNarrow ? "hidden" : "flex"} items-start px-3 py-1.5 border-t border-white/[0.06] font-mono text-[13px] min-h-[32px]`}
           style={{ background: "#0d0d14" }}
         >
+          {/* 📎 attach — target-aware: disabled until a window is selected */}
+          <input
+            ref={fileInputRef}
+            type="file"
+            accept="image/png,image/jpeg,image/webp,image/gif"
+            className="hidden"
+            onChange={(e) => {
+              const f = e.target.files?.[0];
+              if (f) uploadAttachment(f);
+              e.target.value = "";  // allow re-selecting the same file
+            }}
+          />
+          <span
+            className="mr-2 mt-[1px] flex-shrink-0 select-none"
+            title={selectedTarget ? "แนบภาพไปยังหน้าต่างที่เลือก" : "เลือกหน้าต่างก่อน"}
+            style={{
+              cursor: selectedTarget && !uploading ? "pointer" : "not-allowed",
+              opacity: selectedTarget && !uploading ? 0.85 : 0.25,
+            }}
+            onMouseDown={(e) => e.preventDefault()}  // keep terminal focus
+            onClick={() => { if (selectedTarget && !uploading) fileInputRef.current?.click(); }}
+          >
+            {uploading ? "⏳" : "📎"}
+          </span>
           <span className="text-white/30 mr-2 mt-[1px] flex-shrink-0">&gt;</span>
           <span className="text-white/90 whitespace-pre flex-1">{inputBuf}</span>
           <span

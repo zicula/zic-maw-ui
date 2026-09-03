@@ -1,5 +1,8 @@
 import { useState, useCallback, useMemo, useEffect, useRef, type ReactNode } from "react";
 import { useWebSocket } from "./hooks/useWebSocket";
+import { wsRefusalNotice } from "./lib/wsRefusalNotice";
+import { InlineOperatorAuth } from "./components/InlineOperatorAuth";
+import { OPEN_MODE } from "./lib/api";
 import { useSessions } from "./hooks/useSessions";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { UniverseBg } from "./components/UniverseBg";
@@ -30,6 +33,7 @@ import { LoadingSkeleton } from "./components/LoadingSkeleton";
 import { ShortcutOverlay } from "./components/ShortcutOverlay";
 import { JumpOverlay } from "./components/JumpOverlay";
 import { OracleSearch } from "./components/OracleSearch";
+import { useDevice } from "./hooks/useDevice";
 import { unlockAudio, isAudioUnlocked, setSoundMuted, SOUND_PROFILES, getSoundProfile, setSoundProfile, previewSound } from "./lib/sounds";
 
 function FloatingButtons() {
@@ -172,10 +176,12 @@ function useAudioUnlock() {
 }
 
 /** Shared layout — StatusBar + overlays rendered once for all views */
-function Layout({ activeView, connected, reconnecting, agentCount, sessionCount, tabCount, askCount, muted, onToggleMute, onJump, onInbox, statusBarChildren, terminalModal, showShortcuts, onCloseShortcuts, jumpOverlay, inboxOverlay, broadcastModal, fullHeight, children }: {
+function Layout({ activeView, connected, reconnecting, serverError, wsRefused, agentCount, sessionCount, tabCount, askCount, muted, onToggleMute, onJump, onInbox, statusBarChildren, terminalModal, showShortcuts, onCloseShortcuts, jumpOverlay, inboxOverlay, broadcastModal, fullHeight, children }: {
   activeView: string;
   connected: boolean;
   reconnecting?: boolean;
+  serverError?: string | null;
+  wsRefused?: boolean;
   agentCount: number;
   sessionCount: number;
   tabCount?: number;
@@ -211,6 +217,9 @@ function Layout({ activeView, connected, reconnecting, agentCount, sessionCount,
     const t = setTimeout(() => setWsLate(true), 8000);
     return () => clearTimeout(t);
   }, [connected]);
+  // Refusal only makes sense while HTTP is healthy — if both are down the host
+  // is simply unreachable, which the branch below already explains correctly.
+  const refusalVisible = !!wsRefused && httpHealth.healthy;
   const stale = isRemote && (wsLate || !httpHealth.healthy);
 
   const onDisconnect = useCallback(() => {
@@ -237,29 +246,41 @@ function Layout({ activeView, connected, reconnecting, agentCount, sessionCount,
       <FloatingButtons />
 
       {/* Self-healing banner — stale remote host */}
-      {stale && (
+      {(refusalVisible || serverError || stale) && (
         <div className="fixed top-0 inset-x-0 z-[9999] flex justify-center pt-3 px-4 pointer-events-none">
           <div className="pointer-events-auto flex items-center gap-3 px-4 py-2.5 rounded-xl backdrop-blur-xl shadow-lg max-w-2xl" style={{ background: "rgba(20,5,5,0.92)", border: "1px solid rgba(239,68,68,0.4)" }}>
             <span className="text-lg">⚠️</span>
             <div className="flex-1 min-w-0">
               <p className="font-mono text-xs" style={{ color: "#fca5a5" }}>
-                {!httpHealth.healthy
+                {refusalVisible
+                  ? <>{wsRefusalNotice().title}</>
+                  : serverError
+                  ? <>Live data is stale</>
+                  : !httpHealth.healthy
                   ? <>Requests blocked — <span className="font-bold">{activeHost}</span></>
                   : <>Can't reach <span className="font-bold">{activeHost}</span></>}
               </p>
               <p className="font-mono text-[10px]" style={{ color: "rgba(255,255,255,0.4)" }}>
-                {!httpHealth.healthy
+                {refusalVisible
+                  ? wsRefusalNotice().detail
+                  : serverError
+                  ? serverError
+                  : !httpHealth.healthy
                   ? <>Circuit open after {httpHealth.consecutiveFails} failures ({httpHealth.lastError || "network"}). Chrome PNA may be blocking HTTP→LAN — try https:// or change host.</>
                   : <>Host unreachable from this network. Disconnect to pick another, or check the LAN.</>}
               </p>
+              {/* Refusal is the one banner state the operator can fix in place. */}
+              {refusalVisible && OPEN_MODE && <InlineOperatorAuth />}
             </div>
-            <button
-              onClick={onDisconnect}
-              className="shrink-0 px-3 py-1.5 rounded-lg text-xs font-medium transition-all hover:brightness-125 active:scale-95"
-              style={{ background: "rgba(239,68,68,0.2)", color: "#fca5a5", border: "1px solid rgba(239,68,68,0.4)" }}
-            >
-              Disconnect
-            </button>
+            {stale && (
+              <button
+                onClick={onDisconnect}
+                className="shrink-0 px-3 py-1.5 rounded-lg text-xs font-medium transition-all hover:brightness-125 active:scale-95"
+                style={{ background: "rgba(239,68,68,0.2)", color: "#fca5a5", border: "1px solid rgba(239,68,68,0.4)" }}
+              >
+                Disconnect
+              </button>
+            )}
           </div>
         </div>
       )}
@@ -295,7 +316,9 @@ export function App() {
 
   const rawRoute = useHashRoute();
   const { view: route, agentName: hashAgent } = parseHash(rawRoute);
+  const { isNarrow } = useDevice();
   const [selectedAgent, setSelectedAgent] = useState<AgentState | null>(null);
+  const [hashTerminalTarget, setHashTerminalTarget] = useState<string | null>(null);
   const [showShortcuts, setShowShortcuts] = useState(false);
   const [showJump, setShowJump] = useState(false);
   const [showInbox, setShowInbox] = useState(false);
@@ -345,7 +368,7 @@ export function App() {
     return () => window.removeEventListener("keydown", handler, true);
   }, []);
 
-  const { sessions, agents, eventLog, addEvent, handleMessage, feedEvents, feedActive, agentFeedLog, teams, looseAgents } = useSessions();
+  const { sessions, agents, eventLog, addEvent, handleMessage, feedEvents, feedActive, agentFeedLog, teams, looseAgents, serverError } = useSessions();
 
   // Source filter: all / local / remote (synced via CustomEvent from FloatingButtons)
   const [sourceFilter, setSourceFilter] = useState<"all" | "local" | "remote">(() => (localStorage.getItem("office-source-filter") as any) || "all");
@@ -374,11 +397,15 @@ export function App() {
     if (lastResolvedAgent.current === hashAgent) return;
     const name = hashAgent.toLowerCase();
     const match = agents.find(a => a.name.toLowerCase() === name);
-    if (match) {
+    if (match && route === "terminal" && !isNarrow) {
+      setHashTerminalTarget(match.target);
+      setSelectedAgent(null);
+      lastResolvedAgent.current = hashAgent;
+    } else if (match) {
       setSelectedAgent(match);
       lastResolvedAgent.current = hashAgent;
     }
-  }, [agents, hashAgent]);
+  }, [agents, hashAgent, route, isNarrow]);
 
   // Close terminal when hash loses the agent part (e.g. browser back).
   // Uses a ref guard to avoid racing with onSelectAgent: the hashchange
@@ -403,7 +430,7 @@ export function App() {
   const muted = useFleetStore((s) => s.muted);
   const toggleMuted = useFleetStore((s) => s.toggleMuted);
   useEffect(() => { setSoundMuted(muted); }, [muted]);
-  const { connected, reconnecting, send } = useWebSocket(handleMessage);
+  const { connected, reconnecting, refused: wsRefused, send } = useWebSocket(handleMessage);
 
   const onSelectAgent = useCallback((agent: AgentState) => {
     justSelectedRef.current = true;
@@ -450,6 +477,8 @@ export function App() {
   const layoutProps = {
     connected,
     reconnecting,
+    serverError,
+    wsRefused,
     agentCount: filteredAgents.length,
     sessionCount: sessions.length,
     tabCount: sessions.reduce((sum, s) => sum + s.windows.length, 0),
@@ -466,7 +495,7 @@ export function App() {
     jumpOverlay: showJump ? <JumpOverlay agents={agents} onSelect={onSelectAgent} onClose={onCloseJump} /> : null,
     inboxOverlay: showInbox ? <InboxOverlay send={send} onClose={onCloseInbox} /> : null,
     broadcastModal: (<>
-      {showBroadcast && <BroadcastModal agents={agents} send={send} onClose={onCloseBroadcast} />}
+      {showBroadcast && <BroadcastModal agents={agents} onClose={onCloseBroadcast} />}
       {showOracleSearch && <OracleSearch onClose={onCloseSearch} />}
     </>),
   };
@@ -552,7 +581,7 @@ export function App() {
   if (route === "terminal") {
     return (
       <Layout activeView="terminal" {...layoutProps} fullHeight>
-        <TerminalView sessions={sessions} agents={agents} connected={connected} onSelectAgent={onSelectAgent} />
+        <TerminalView sessions={sessions} agents={agents} connected={connected} onSelectAgent={onSelectAgent} initialTarget={hashTerminalTarget} />
       </Layout>
     );
   }

@@ -1,15 +1,18 @@
 /**
  * AppShell — shared layout for all standalone apps.
- * Provides: WebSocket connection, StatusBar, error boundary, PIN lock.
+ * Provides: WebSocket connection, StatusBar, error boundary.
  * Each app mounts its view inside this shell.
  */
 import { type ReactNode, useCallback, useEffect } from "react";
 import { useWebSocket } from "../hooks/useWebSocket";
+import { useHttpHealth } from "../hooks/useHttpHealth";
+import { wsRefusalNotice } from "../lib/wsRefusalNotice";
+import { InlineOperatorAuth } from "../components/InlineOperatorAuth";
+import { OPEN_MODE } from "../lib/api";
 import { useSessions } from "../hooks/useSessions";
 import { useFleetStore } from "../lib/store";
 import { StatusBar } from "../components/StatusBar";
 import { ErrorBoundary } from "../components/ErrorBoundary";
-import { PinLock } from "../components/PinLock";
 import { setSoundMuted } from "../lib/sounds";
 import type { AgentState } from "../lib/types";
 
@@ -33,18 +36,22 @@ export interface AppContext {
   teams: ReturnType<typeof useSessions>["teams"];
   connected: boolean;
   reconnecting: boolean;
+  serverError: string | null;
   send: (msg: object) => void;
   onSelectAgent: (agent: AgentState) => void;
 }
 
 export function AppShell({ view, fullHeight, children }: AppShellProps) {
-  const { sessions, agents, eventLog, addEvent, handleMessage, feedEvents, feedActive, agentFeedLog, teams } = useSessions();
+  const { sessions, agents, eventLog, addEvent, handleMessage, feedEvents, feedActive, agentFeedLog, teams, serverError } = useSessions();
 
   const muted = useFleetStore((s) => s.muted);
   const toggleMuted = useFleetStore((s) => s.toggleMuted);
   useEffect(() => { setSoundMuted(muted); }, [muted]);
 
-  const { connected, reconnecting, send } = useWebSocket(handleMessage);
+  const { connected, reconnecting, refused: wsRefused, send } = useWebSocket(handleMessage);
+  const httpHealth = useHttpHealth();
+  // Only claim "HTTP works, but the socket is refused" when HTTP really is fine.
+  const refusalVisible = wsRefused && httpHealth.healthy;
   const askCount = useFleetStore((s) => s.asks.filter((a) => !a.dismissed).length);
 
   const onSelectAgent = useCallback((agent: AgentState) => {
@@ -59,12 +66,11 @@ export function AppShell({ view, fullHeight, children }: AppShellProps) {
 
   const ctx: AppContext = {
     sessions, agents, eventLog, addEvent, feedEvents, feedActive, agentFeedLog, teams,
-    connected, reconnecting, send, onSelectAgent,
+    connected, reconnecting, serverError, send, onSelectAgent,
   };
 
   return (
     <ErrorBoundary>
-      <PinLock>
         <div className={wrapperClass} style={{ background: "#020208" }}>
           <div className={`relative z-10${fullHeight ? " flex-shrink-0" : ""}`}>
             <StatusBar
@@ -81,6 +87,19 @@ export function AppShell({ view, fullHeight, children }: AppShellProps) {
             />
           </div>
           {children(ctx)}
+          {(refusalVisible || serverError) && (
+            <div className="fixed top-0 inset-x-0 z-[9999] flex justify-center pt-3 px-4 pointer-events-none">
+              <div className="pointer-events-auto px-4 py-2.5 rounded-xl backdrop-blur-xl shadow-lg max-w-2xl" style={{ background: "rgba(20,5,5,0.92)", border: "1px solid rgba(239,68,68,0.4)" }}>
+                <p className="font-mono text-xs font-bold" style={{ color: "#fca5a5" }}>
+                  ⚠️ {refusalVisible ? wsRefusalNotice().title : "Live data is stale"}
+                </p>
+                <p className="font-mono text-[10px]" style={{ color: "rgba(255,255,255,0.4)" }}>
+                  {refusalVisible ? wsRefusalNotice().detail : serverError}
+                </p>
+                {refusalVisible && OPEN_MODE && <InlineOperatorAuth />}
+              </div>
+            </div>
+          )}
           <div
             className="fixed bottom-1 right-2 z-[9999] font-mono pointer-events-none select-none"
             style={{ fontSize: 9, color: "rgba(255,255,255,0.25)" }}
@@ -98,7 +117,6 @@ export function AppShell({ view, fullHeight, children }: AppShellProps) {
             </div>
           )}
         </div>
-      </PinLock>
     </ErrorBoundary>
   );
 }

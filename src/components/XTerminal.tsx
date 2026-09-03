@@ -1,8 +1,8 @@
-import { useEffect, useRef } from "react";
+import { useEffect, useRef, forwardRef, useImperativeHandle } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
 import "@xterm/xterm/css/xterm.css";
-import { wsUrl } from "../lib/api";
+import { openWs } from "../lib/api";
 import type { AgentState } from "../lib/types";
 
 interface XTerminalProps {
@@ -13,6 +13,15 @@ interface XTerminalProps {
   onSelectSibling: (agent: AgentState) => void;
   readOnly?: boolean;
 }
+
+// Imperative handle so the chrome (TerminalModal) can inject text into the PTY
+// without owning the WebSocket — used by the 📎 attach button to type a saved
+// image path into the running Oracle, mirroring TerminalView's queueSend path.
+export interface XTerminalHandle {
+  inject: (text: string) => void;
+}
+
+const enc = new TextEncoder();
 
 // Catppuccin Mocha palette (matches AC array in ansi.ts)
 const THEME = {
@@ -39,8 +48,22 @@ const THEME = {
   brightWhite: "#ffffff",
 };
 
-export function XTerminal({ target, onClose, onNavigate, siblings, onSelectSibling, readOnly = false }: XTerminalProps) {
+export const XTerminal = forwardRef<XTerminalHandle, XTerminalProps>(function XTerminal(
+  { target, onClose, onNavigate, siblings, onSelectSibling, readOnly = false },
+  ref,
+) {
   const containerRef = useRef<HTMLDivElement>(null);
+  const wsRef = useRef<WebSocket | null>(null);
+
+  // Inject text into the live PTY as if typed. `\r` submits (xterm sends CR on
+  // Enter). No-op in read-only mode or when the socket isn't open.
+  useImperativeHandle(ref, () => ({
+    inject: (text: string) => {
+      const ws = wsRef.current;
+      if (readOnly || !ws || ws.readyState !== WebSocket.OPEN) return;
+      ws.send(enc.encode(text));
+    },
+  }), [readOnly]);
 
   // Keep callbacks in refs so terminal effect doesn't re-run on every render
   const onCloseRef = useRef(onClose);
@@ -70,6 +93,7 @@ export function XTerminal({ target, onClose, onNavigate, siblings, onSelectSibli
     term.loadAddon(fit);
 
     let ws: WebSocket | null = null;
+    let disposed = false;
     let dataSub: { dispose: () => void } | null = null;
     let binSub: { dispose: () => void } | null = null;
     let resizeTimer: ReturnType<typeof setTimeout>;
@@ -83,9 +107,13 @@ export function XTerminal({ target, onClose, onNavigate, siblings, onSelectSibli
         term.focus();
       } catch { return; }
 
-      // Connect to PTY WebSocket
-      ws = new WebSocket(wsUrl("/ws/pty"));
+      // Connect to PTY WebSocket. Ticket minting is async — `disposed` guards
+      // against the effect being torn down while the mint is still in flight.
+      openWs("/ws/pty").then(socket => {
+      if (disposed) { socket.close(); return; }
+      ws = socket;
       ws.binaryType = "arraybuffer";
+      wsRef.current = ws;
 
       ws.onopen = () => {
         ws!.send(JSON.stringify({
@@ -117,6 +145,7 @@ export function XTerminal({ target, onClose, onNavigate, siblings, onSelectSibli
       ws.onclose = () => {
         term.write("\r\n\x1b[31m[connection closed]\x1b[0m\r\n");
       };
+      }).catch(() => {});
 
       if (!readOnly) {
         // Keystrokes → binary to PTY stdin
@@ -166,15 +195,17 @@ export function XTerminal({ target, onClose, onNavigate, siblings, onSelectSibli
     }, 50);
 
     return () => {
+      disposed = true;
       clearTimeout(openTimer);
       clearTimeout(resizeTimer);
       resizeObserver?.disconnect();
       dataSub?.dispose();
       binSub?.dispose();
       ws?.close();
+      if (wsRef.current === ws) wsRef.current = null;
       term.dispose();
     };
   }, [target]);
 
   return <div ref={containerRef} className="w-full h-full" />;
-}
+});

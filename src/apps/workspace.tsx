@@ -1,8 +1,7 @@
-import { createRoot } from "react-dom/client";
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import "../index.css";
 import { useWebSocket } from "../hooks/useWebSocket";
-import { apiUrl } from "../lib/api";
+import { apiFetch } from "../lib/api";
 import type { FeedEvent, FeedEventType } from "../lib/feed";
 import type { PaneStatus, Session } from "../lib/types";
 
@@ -65,7 +64,7 @@ function timeAgo(ts: number): string {
 
 // ─── App ───
 
-function App() {
+export default function App() {
   const [nodes, setNodes] = useState<Record<string, Node>>({});
   const [statuses, setStatuses] = useState<Record<string, PaneStatus>>({});
   const [feed, setFeed] = useState<(FeedEvent & { _node?: string })[]>([]);
@@ -203,7 +202,7 @@ function App() {
       ? [null, sendTarget]
       : sendTarget.split("/");
 
-    fetch(apiUrl("/api/action"), {
+    apiFetch("/api/action", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ type: "send", target: agent || sendTarget, text: sendText.trim() + "\r" }),
@@ -446,7 +445,7 @@ function JoinWorkspace() {
           onClick={() => {
             if (!name.trim()) return;
             setCreating(true);
-            fetch(apiUrl("/api/action"), {
+            apiFetch("/api/action", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
               body: JSON.stringify({ type: "workspace-create", name: name.trim() }),
@@ -486,6 +485,3 @@ function StatRow({ label, count, color, status, onClick, active }: {
     </div>
   );
 }
-
-// ─── Mount ───
-createRoot(document.getElementById("root")!).render(<App />);

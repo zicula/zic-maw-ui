@@ -1,7 +1,7 @@
 import { useState, useCallback, useRef, useEffect, useMemo } from "react";
 import type { Session, AgentState, AgentEvent } from "../lib/types";
 import type { Team } from "../components/TeamPanel";
-import { apiUrl } from "../lib/api";
+import { apiFetch } from "../lib/api";
 import { stripAnsi } from "../lib/ansi";
 import { agentSortKey } from "../lib/constants";
 import { playWakeSound } from "../lib/sounds";
@@ -11,13 +11,16 @@ import { usePreviewStore } from "../lib/previewStore";
 import { matchAgentToEvent } from "../lib/resolveAgent";
 import { classifyNotification } from "../lib/classifyNotification";
 import { activeOracles, type FeedEvent, type FeedEventType } from "../lib/feed";
+import { acceptFeedEvent } from "../lib/feedEventOrder";
 import type { AskType } from "../lib/types";
+import { wsServerError } from "../lib/wsServerError";
 
 const BUSY_TIMEOUT = 15_000; // 15s without feed → ready
 const IDLE_TIMEOUT = 60_000; // 60s without feed → idle
 
 export function useSessions() {
   const [sessions, setSessions] = useState<Session[]>([]);
+  const [serverError, setServerError] = useState<string | null>(null);
   const sessionsRef = useRef(sessions);
   sessionsRef.current = sessions;
   const sessionsJsonRef = useRef("");
@@ -45,7 +48,7 @@ export function useSessions() {
   // doesn't deliver them (race on first connect, server restart, etc.).
   // Ported from c664f95 (Casa Oracle, PR #6).
   useEffect(() => {
-    fetch(apiUrl("/api/teams"))
+    apiFetch("/api/teams")
       .then(r => r.json())
       .then(data => setTeams(data.teams || []))
       .catch(() => {});
@@ -62,6 +65,7 @@ export function useSessions() {
   // target → last feed timestamp, target → last event type
   const feedLastSeen = useRef<Record<string, number>>({});
   const feedLastEvent = useRef<Record<string, FeedEventType>>({});
+  const latestFeedEventTs = useRef<Record<string, number>>({});
 
   const FEED_BUSY_EVENTS = new Set<FeedEventType>(["PreToolUse", "PostToolUse", "UserPromptSubmit", "SubagentStart", "PostToolUseFailure"]);
   const FEED_STOP_EVENTS = new Set<FeedEventType>(["Stop", "SessionEnd", "TaskCompleted", "Notification"]);
@@ -78,6 +82,10 @@ export function useSessions() {
     if (!agent) return;
 
     const target = agent.target;
+    // A reconnect replays feed-history after live events may already have
+    // arrived. Never let an older Stop/Notification regress a current busy
+    // agent and remove its ON STAGE avatar.
+    if (!acceptFeedEvent(latestFeedEventTs.current, target, event.ts)) return;
     const { setStatus, getStatus } = useFeedStatusStore.getState();
 
     feedLastEvent.current[target] = event.event;
@@ -180,7 +188,11 @@ export function useSessions() {
   }, [resolveAgentFromFeed]);
 
   const handleMessage = useCallback((data: any) => {
-    if (data.type === "sessions") {
+    const error = wsServerError(data);
+    if (error) {
+      setServerError(error);
+    } else if (data.type === "sessions") {
+      setServerError(null);
       const next = (data.sessions as Session[]).filter(s => !s.name.startsWith("maw-pty-"));
       // Server pushes sessions every 2s whether or not anything changed
       // (verified: 23/23 identical payloads in 45s). Skip identical pushes —
@@ -364,5 +376,5 @@ export function useSessions() {
     return map;
   }, [feedEvents, resolveAgentFromFeed]);
 
-  return { sessions, agents, eventLog, addEvent, handleMessage, feedEvents, feedActive, agentFeedLog, teams, looseAgents };
+  return { sessions, agents, eventLog, addEvent, handleMessage, feedEvents, feedActive, agentFeedLog, teams, looseAgents, serverError };
 }

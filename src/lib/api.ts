@@ -1,102 +1,251 @@
 /**
  * Centralized API host resolution — local.drizzle.studio pattern.
- *
- * Loaded from CF (local.buildwithoracle.com): user passes ?host=white.local:3456
- *   Server auto-detects mkcert and serves HTTPS (same as drizzle-kit).
- * Loaded locally (same origin): uses relative paths.
- *
- * The host param accepts THREE forms:
- *
- *   ?host=white.local:3456              → https://white.local:3456
- *                                         (bare host:port — defaults to https,
- *                                         backwards-compatible behavior)
- *
- *   ?host=https://white.local:3456      → https://white.local:3456
- *                                         (explicit https — same result)
- *
- *   ?host=http://oracle-world:3456      → http://oracle-world:3456
- *                                         (explicit http — needed for plain-HTTP
- *                                         maw-js nodes on the LAN, e.g. oracle-world
- *                                         where mkcert isn't deployed)
- *
- * Discovered the http:// gap during /lens smoke testing on 2026-04-11:
- * the v1.1 PR claimed "the lens reads any maw-js" but the apiUrl helper
- * hardcoded https://, so any HTTP-only node was unreachable. This restores
- * the claim. See ψ/memory/feedback_ground_before_proposing.md (claim drift —
- * incident #5 in the night's count).
  */
 
 const STORAGE_KEY = "maw-host";
 const RECENT_KEY = "maw-host-recent";
 
-const params = new URLSearchParams(window.location.search);
-const urlHost = params.get("host");
+/**
+ * Build-time only — never a runtime or server-reported signal.
+ *
+ * Set at build time (`VITE_OPEN_MODE=1 vite build`) for deployments that
+ * deliberately run without operator auth. Vite statically replaces
+ * `import.meta.env.VITE_*`, so the default gated build compiles this to
+ * `false` and the auth checks below become unconditional — the open path is
+ * not present in that bundle at all.
+ */
+export const OPEN_MODE = import.meta.env.VITE_OPEN_MODE === "1";
 
-// Auto-persist: ?host= in URL → save to localStorage → redirect clean
-if (urlHost) {
-  localStorage.setItem(STORAGE_KEY, urlHost);
-  addRecentHost(urlHost);
-  const url = new URL(window.location.href);
-  url.searchParams.delete("host");
-  window.location.replace(url.toString());
+// The W3C secure-contexts spec exempts loopback addresses from mixed-content
+// blocking: browsers treat http://localhost, http://127.0.0.0/8, and
+// http://[::1] as "potentially trustworthy" regardless of the page's own
+// scheme, because they are reachable only from the same machine. This is
+// narrower than isPrivateHost() below (which also covers 10.x/192.168.x/.local
+// for the Chrome PNA targetAddressSpace header) — those DO still need HTTPS
+// or explicit PNA opt-in and are not exempt here.
+function isLoopbackHostname(hostname: string): boolean {
+  const host = hostname.toLowerCase();
+  return host === "localhost" || host === "[::1]" || host === "::1" || /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/.test(host);
 }
 
-const hostParam = localStorage.getItem(STORAGE_KEY);
+/** Pure trust boundary for every backend origin used by operator auth. */
+export function canonicalizeBackendOrigin(
+  input: string,
+  pageProtocol: string,
+): { exactOrigin: string; mixedContent: boolean } {
+  const value = input.trim();
+  if (!value || value.startsWith("//") || /[@?#]/.test(value) || !/^(?:https?:\/\/)?[^/\\]+\/?$/i.test(value)) throw new Error("invalid_backend_origin");
+  const hasScheme = /^https?:\/\//i.test(value);
+  const schemeLike = /^[a-z][a-z\d+.-]*:/i.test(value);
+  if (schemeLike && !hasScheme && !/^[^/?#]+:\d+\/?$/.test(value)) throw new Error("invalid_backend_origin");
+  let url: URL;
+  try { url = new URL(hasScheme ? value : `https://${value}`); }
+  catch { throw new Error("invalid_backend_origin"); }
+  if ((url.protocol !== "http:" && url.protocol !== "https:") ||
+      url.username || url.password || url.pathname !== "/" || url.search || url.hash) {
+    throw new Error("invalid_backend_origin");
+  }
+  return {
+    exactOrigin: url.origin,
+    mixedContent: pageProtocol === "https:" && url.protocol === "http:" && !isLoopbackHostname(url.hostname),
+  };
+}
+
+const pageLocation = () => typeof window === "undefined" ? null : window.location;
+const storage = () => typeof localStorage === "undefined" ? null : localStorage;
+let hostParam = storage()?.getItem(STORAGE_KEY) ?? null;
+
+function activeBackendOrigin(): string | null {
+  const input = hostParam ?? pageLocation()?.origin ?? "http://localhost";
+  try { return canonicalizeBackendOrigin(input, pageLocation()?.protocol ?? "http:").exactOrigin; }
+  catch { return null; }
+}
+
+export function getActiveBackendOrigin(): string | null { return activeBackendOrigin(); }
+
+type OperatorCredential = { exactOrigin: string; token: string; generation: number };
+export type OperatorAuthOutcome = "authenticated" | "unauthorized" | "forbidden" | "unavailable"
+  | "invalid_response" | "aborted" | "stale";
+
+let operatorCredential: OperatorCredential | null = null;
+let operatorGeneration = 0;
+const operatorListeners = new Set<() => void>();
+
+function candidateHeaders(token: string): Headers | null {
+  const bytes = new TextEncoder().encode(token).byteLength;
+  if (!token.trim() || bytes > 4096) return null;
+  try {
+    const headers = new Headers({ Authorization: `Bearer ${token}`, "Content-Type": "application/json" });
+    return headers.get("Authorization") === `Bearer ${token}` ? headers : null;
+  } catch { return null; }
+}
+
+function invalidateOperatorCredential(expected?: OperatorCredential): void {
+  if (expected && operatorCredential !== expected) return;
+  operatorGeneration++;
+  if (!operatorCredential) return;
+  operatorCredential = null;
+  operatorListeners.forEach(listener => listener());
+}
+
+export function clearOperatorCredential(): void { invalidateOperatorCredential(); }
+export function hasOperatorCredential(): boolean { return operatorCredential !== null; }
+export function subscribeOperatorCredential(listener: () => void): () => void {
+  operatorListeners.add(listener);
+  return () => { operatorListeners.delete(listener); };
+}
+
+export async function authenticateOperator(token: string, signal?: AbortSignal): Promise<OperatorAuthOutcome> {
+  invalidateOperatorCredential();
+  const generation = operatorGeneration;
+  const exactOrigin = activeBackendOrigin();
+  const headers = candidateHeaders(token);
+  const current = () => generation === operatorGeneration && activeBackendOrigin() === exactOrigin;
+  if (!exactOrigin || !headers) return "invalid_response";
+  if (canonicalizeBackendOrigin(exactOrigin, pageLocation()?.protocol ?? "http:").mixedContent) return "invalid_response";
+  const init: RequestInit & { targetAddressSpace?: "loopback" | "local" } = {
+    method: "POST", headers, body: '{"path":"/ws"}', credentials: "omit", redirect: "error",
+    cache: "no-store", signal,
+  };
+  if (isPrivateHost()) init.targetAddressSpace = new URL(exactOrigin).hostname.toLowerCase() === "localhost"
+    || new URL(exactOrigin).hostname === "127.0.0.1" ? "loopback" : "local";
+  let response: Response;
+  try { response = await fetch(`${exactOrigin}/api/auth/ws-ticket`, init); }
+  catch (error) {
+    if (!current()) return "stale";
+    return signal?.aborted || (error && typeof error === "object" && "name" in error && error.name === "AbortError")
+      ? "aborted" : "unavailable";
+  }
+  if (!current()) return "stale";
+  if (response.status === 401) return "unauthorized";
+  if (response.status === 403) return "forbidden";
+  if (response.status >= 500) return "unavailable";
+  const jsonType = /^application\/json(?:\s*;|$)/i.test(response.headers.get("Content-Type") ?? "");
+  const noStore = (response.headers.get("Cache-Control") ?? "").split(",")
+    .some(directive => directive.trim().toLowerCase() === "no-store");
+  if (response.status !== 200 || !jsonType || !noStore) return "invalid_response";
+  let proof: unknown;
+  try { proof = await response.json(); }
+  catch { return current() ? "invalid_response" : "stale"; }
+  if (!current()) return "stale";
+  if (!proof || typeof proof !== "object" || Array.isArray(proof)
+      || Object.keys(proof).sort().join() !== "protocol,ticket") return "invalid_response";
+  const value = proof as { protocol?: unknown; ticket?: unknown };
+  if (value.protocol !== "maw.ws.v1" || typeof value.ticket !== "string"
+      || !/^mwt1_[0-9a-f]{64}$/.test(value.ticket)) return "invalid_response";
+  operatorCredential = { exactOrigin, token, generation };
+  operatorListeners.forEach(listener => listener());
+  return "authenticated";
+}
+
+/** WebSocket subprotocol maw-rs echoes back on an accepted ticketed upgrade. */
+export const WS_PROTOCOL = "maw.ws.v1";
+
+/**
+ * Mint a fresh one-use WebSocket ticket for `path`.
+ *
+ * Browsers cannot set arbitrary headers on a WebSocket handshake, so maw-rs
+ * takes the credential as a subprotocol value instead: the client opens with
+ * ["maw.ws.v1", "<ticket>"] and the server echoes back only "maw.ws.v1".
+ * Tickets are one-use and origin-bound, so every connect AND reconnect needs
+ * a fresh one — never cache the result of this call.
+ *
+ * Returns null when there is no verified credential for the active origin, or
+ * when the mint is refused/malformed. Callers must treat null as "connect
+ * unticketed" and let the server decide, rather than blocking the connection:
+ * a maw-rs old enough to predate ticketing accepts an unticketed upgrade.
+ */
+/**
+ * Open a WebSocket to `path`, carrying a fresh one-use ticket when we hold a
+ * verified operator credential.
+ *
+ * Every `/ws*` consumer must go through this rather than constructing a socket
+ * directly — a token-configured maw serve refuses any Origin-bearing upgrade
+ * that arrives without a ticket, and browsers always send Origin. The
+ * source-inventory test in apiMigration.test.ts enforces that.
+ */
+export async function openWs(path: string): Promise<WebSocket> {
+  const ticket = await mintWsTicket(path);
+  return ticket
+    ? new WebSocket(wsUrl(path), [WS_PROTOCOL, ticket])
+    : new WebSocket(wsUrl(path));
+}
+
+export async function mintWsTicket(path: string): Promise<string | null> {
+  const credential = operatorCredential;
+  if (!credential) return null;
+  const generation = credential.generation;
+  let response: Response;
+  try {
+    response = await apiFetch("/api/auth/ws-ticket", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ path }),
+    });
+  } catch { return null; }
+  // A credential change mid-flight invalidates this ticket's binding.
+  if (operatorCredential !== credential || operatorCredential.generation !== generation) return null;
+  if (!response.ok) return null;
+  let proof: unknown;
+  try { proof = await response.json(); }
+  catch { return null; }
+  if (!proof || typeof proof !== "object" || Array.isArray(proof)) return null;
+  const value = proof as { protocol?: unknown; ticket?: unknown };
+  if (value.protocol !== WS_PROTOCOL || typeof value.ticket !== "string"
+      || !/^mwt1_[0-9a-f]{64}$/.test(value.ticket)) return null;
+  return value.ticket;
+}
 
 /** Whether we're running in remote mode */
 export const isRemote = !!hostParam;
 
 /** Where the active host came from (always "config" or "local" after redirect) */
 export const hostSource: "config" | "local" =
-  localStorage.getItem(STORAGE_KEY) ? "config" : "local";
+  storage()?.getItem(STORAGE_KEY) ? "config" : "local";
 
 /** Raw active host value (from URL or config) */
 export const activeHost: string | null = hostParam;
 
 /** Read stored host from config */
 export function getStoredHost(): string | null {
-  return localStorage.getItem(STORAGE_KEY);
+  return storage()?.getItem(STORAGE_KEY) ?? null;
 }
 
 /** Save host to config + add to recent list */
 export function setStoredHost(host: string): void {
-  localStorage.setItem(STORAGE_KEY, host);
-  addRecentHost(host);
+  const next = canonicalizeBackendOrigin(host, pageLocation()?.protocol ?? "http:");
+  clearOperatorCredential();
+  hostParam = next.exactOrigin;
+  storage()?.setItem(STORAGE_KEY, next.exactOrigin);
+  addRecentHost(next.exactOrigin);
 }
 
 /** Clear stored host (revert to local) */
 export function clearStoredHost(): void {
-  localStorage.removeItem(STORAGE_KEY);
+  clearOperatorCredential();
+  hostParam = null;
+  storage()?.removeItem(STORAGE_KEY);
 }
 
 /** Get recent hosts list */
 export function getRecentHosts(): string[] {
   try {
-    return JSON.parse(localStorage.getItem(RECENT_KEY) || "[]");
+    return JSON.parse(storage()?.getItem(RECENT_KEY) || "[]");
   } catch { return []; }
 }
 
 function addRecentHost(host: string): void {
   const recent = getRecentHosts().filter(h => h !== host);
   recent.unshift(host);
-  localStorage.setItem(RECENT_KEY, JSON.stringify(recent.slice(0, 8)));
+  storage()?.setItem(RECENT_KEY, JSON.stringify(recent.slice(0, 8)));
 }
 
 /** Resolved {protocol, host:port} from `hostParam`, or null if same-origin. */
 function resolveHost(): { httpProto: string; wsProto: string; host: string } | null {
   if (!hostParam) return null;
-  // Strip trailing slash — browsers often append one to the URL, which
-  // causes double-slash in constructed paths: "localhost:3456/" + "/api/config"
-  // → "localhost:3456//api/config". The double-slash misses the CORS middleware
-  // (mounted on "/api/*", not "//api/*") and breaks everything.
-  if (hostParam.startsWith("https://")) {
-    return { httpProto: "https:", wsProto: "wss:", host: hostParam.slice("https://".length).replace(/\/+$/, "") };
-  }
-  if (hostParam.startsWith("http://")) {
-    return { httpProto: "http:", wsProto: "ws:", host: hostParam.slice("http://".length).replace(/\/+$/, "") };
-  }
-  // Bare host:port — default to https for backwards compatibility.
-  return { httpProto: "https:", wsProto: "wss:", host: hostParam.replace(/\/+$/, "") };
+  const origin = canonicalizeBackendOrigin(hostParam, pageLocation()?.protocol ?? "http:").exactOrigin;
+  const url = new URL(origin);
+  return { httpProto: url.protocol, wsProto: url.protocol === "https:" ? "wss:" : "ws:", host: url.host };
 }
 
 /** Build full URL for fetch() calls */
@@ -193,7 +342,34 @@ function isPrivateHost(): boolean {
  * Callers should still .catch — this never resolves on circuit-open.
  */
 export async function apiFetch(path: string, init?: RequestInit): Promise<Response> {
-  const url = path.startsWith("http") ? path : apiUrl(path);
+  if (!path.startsWith("/api/") || path.includes("\\")) throw new Error("invalid_api_path");
+  const activeOrigin = activeBackendOrigin();
+  if (!activeOrigin) throw new Error("invalid_backend_origin");
+  const resolved = new URL(path, `${activeOrigin}/`);
+  if (resolved.origin !== activeOrigin || !resolved.pathname.startsWith("/api/") || resolved.hash) {
+    throw new Error("invalid_api_path");
+  }
+  let suppliedHeaders: Headers;
+  try { suppliedHeaders = new Headers(init?.headers); }
+  catch { throw new Error("invalid_request_headers"); }
+  if (suppliedHeaders.has("Authorization") || suppliedHeaders.has("X-Maw-Token")) {
+    throw new Error("caller_auth_forbidden");
+  }
+  const requestCredential = operatorCredential?.exactOrigin === resolved.origin ? operatorCredential : null;
+  // Fail closed in the gated build: no verified credential, no request.
+  //
+  // OPEN_MODE builds deliberately compile the operator gate out, so a
+  // credential is never installed and this check would reject every one of the
+  // ~50 apiFetch call sites — capture previews, dashboard, config, search,
+  // worktrees, uploads. WebSocket features kept working (they never touch
+  // apiFetch), so the app looked alive while every HTTP-backed panel sat empty.
+  // Same shape as #111: two individually-correct changes failing only in
+  // combination. The flag is build-time and statically replaced, so the gated
+  // build still contains the unconditional throw.
+  if (!OPEN_MODE && !requestCredential) throw new Error("operator_auth_required");
+  const requestToken = requestCredential?.token ?? null;
+  if (requestToken) suppliedHeaders.set("Authorization", `Bearer ${requestToken}`);
+  const url = resolved.toString();
   const now = Date.now();
 
   // Circuit open: allow exactly one probe per OPEN_MS; reject the rest.
@@ -204,7 +380,12 @@ export async function apiFetch(path: string, init?: RequestInit): Promise<Respon
   // Chrome PNA: opt the request into the local-network address space when the
   // active host is private. Older Chromes ignore the option; newer ones use it
   // to drive the permission prompt instead of a hard block.
-  const finalInit: RequestInit & { targetAddressSpace?: "loopback" | "local" | "private" } = { ...init };
+  const finalInit: RequestInit & { targetAddressSpace?: "loopback" | "local" | "private" } = {
+    ...init,
+    headers: suppliedHeaders,
+    credentials: "omit",
+    redirect: "error",
+  };
   if (isPrivateHost()) {
     const r = resolveHost();
     const h = r?.host.split(":")[0].toLowerCase() ?? "";
@@ -214,6 +395,7 @@ export async function apiFetch(path: string, init?: RequestInit): Promise<Respon
 
   try {
     const res = await fetch(url, finalInit);
+    if (res.status === 401 && requestCredential) invalidateOperatorCredential(requestCredential);
     // 5xx is still a "real" failure for breaker purposes; 4xx is not.
     if (res.status >= 500) throw new Error(`http_${res.status}`);
     // Success → reset.
@@ -222,14 +404,21 @@ export async function apiFetch(path: string, init?: RequestInit): Promise<Respon
     }
     return res;
   } catch (err) {
+    if (err && typeof err === "object" && "name" in err && err.name === "AbortError") {
+      const safeAbort = new Error("request_aborted");
+      safeAbort.name = "AbortError";
+      throw safeAbort;
+    }
     const fails = healthSnapshot.consecutiveFails + 1;
-    const msg = err instanceof Error ? err.message : String(err);
+    const raw = err instanceof Error ? err.message : String(err);
+    const msg = requestToken ? "api_fetch_failed" : raw;
+    const safeError = requestToken ? new Error(msg) : err;
     if (fails >= FAIL_THRESHOLD) {
       commit({ healthy: false, consecutiveFails: fails, openUntil: now + OPEN_MS, lastError: msg });
     } else {
       commit({ consecutiveFails: fails, lastError: msg });
     }
-    throw err;
+    throw safeError;
   }
 }
 

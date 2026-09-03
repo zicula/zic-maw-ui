@@ -1,4 +1,3 @@
-import { createRoot } from "react-dom/client";
 import { useState, useEffect, useCallback, useRef, useMemo } from "react";
 import { isVisible } from "../lib/visibility";
 import * as THREE from "three";
@@ -9,7 +8,7 @@ import { UnrealBloomPass } from "three/examples/jsm/postprocessing/UnrealBloomPa
 import { CSS2DRenderer, CSS2DObject } from "three/examples/jsm/renderers/CSS2DRenderer.js";
 import "../index.css";
 import { useWebSocket } from "../hooks/useWebSocket";
-import { apiUrl } from "../lib/api";
+import { apiFetch } from "../lib/api";
 import type { FeedEvent, FeedEventType } from "../lib/feed";
 
 // ─── Types ───
@@ -154,7 +153,7 @@ interface Supernova {
 
 // ─── App ───
 
-function App() {
+export default function App() {
   const mountRef = useRef<HTMLDivElement>(null);
   const sceneRef = useRef<{
     scene: THREE.Scene;
@@ -896,9 +895,9 @@ function App() {
   useEffect(() => {
     async function load() {
       const [config, fleetConfig, feed] = await Promise.all([
-        fetch(apiUrl("/api/config")).then(r => r.json()).catch(() => null),
-        fetch(apiUrl("/api/fleet-config")).then(r => r.json()).catch(() => null),
-        fetch(apiUrl("/api/feed?limit=200")).then(r => r.json()).catch(() => null),
+        apiFetch("/api/config").then(r => r.json()).catch(() => null),
+        apiFetch("/api/fleet-config").then(r => r.json()).catch(() => null),
+        apiFetch("/api/feed?limit=200").then(r => r.json()).catch(() => null),
       ]);
 
       // Identity: which maw-js node is this lens reading?
@@ -1209,5 +1208,3 @@ function App() {
     </div>
   );
 }
-
-createRoot(document.getElementById("root")!).render(<App />);
