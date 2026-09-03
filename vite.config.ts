@@ -62,6 +62,11 @@ export default defineConfig({
   server: {
     host: true,
     allowedHosts: true,
+    // ponytail: 5173 belongs to another bun process on this machine — maw
+    // yields ports, it never takes. Pin the dev server here so operators and
+    // bookmarks get one stable URL instead of vite's auto-increment.
+    port: 5174,
+    strictPort: true,
     proxy: {
       "/api": MAW_HTTP,
       // ponytail: vite's http-proxy needs http:// target even for WS upgrades —
