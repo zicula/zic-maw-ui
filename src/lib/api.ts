@@ -108,6 +108,14 @@ export function apiUrl(path: string): string {
 
 /** WebSocket URL */
 export function wsUrl(path: string): string {
+  // ponytail: vite's /ws proxy silently hangs the WS upgrade handshake on
+  // vite 6.4.1 (verified 2026-07-29 — `changeOrigin:true` makes it fail fast
+  // with no error log, omitting it makes it hang indefinitely). Same-host
+  // (localhost:5173 → localhost:3456), so direct connect has no CORS/Origin
+  // issue — skip the proxy and talk to maw directly.
+  if (path.startsWith("/ws") && !hostParam) {
+    return `ws://${location.hostname}:3457${path}`;
+  }
   const r = resolveHost();
   if (!r) {
     const proto = location.protocol === "https:" ? "wss:" : "ws:";

@@ -7,7 +7,7 @@ import { hostname, userInfo } from "os";
 import { writeFileSync } from "fs";
 import pkg from "./package.json";
 
-const MAW_HTTP = process.env.VITE_MAW_URL ?? "http://localhost:3456";
+const MAW_HTTP = process.env.VITE_MAW_URL ?? "http://localhost:3457";
 const MAW_WS = MAW_HTTP.replace(/^http/, "ws");
 
 const sh = (cmd: string) => { try { return execSync(cmd, { stdio: ["ignore", "pipe", "ignore"] }).toString().trim(); } catch { return "unknown"; } };
@@ -68,8 +68,13 @@ export default defineConfig({
     allowedHosts: true,
     proxy: {
       "/api": MAW_HTTP,
-      "/ws/pty": { target: MAW_WS, ws: true },
-      "/ws": { target: MAW_WS, ws: true },
+      // ponytail: vite's http-proxy needs http:// target even for WS upgrades —
+      // ws:// targets hang silently on the upgrade handshake (verified
+      // 2026-07-28: WS via vite proxy → 0 bytes returned; WS direct to maw →
+      // 101 Switching Protocols). `ws: true` flag tells http-proxy to forward
+      // the Upgrade/Connection headers regardless of target scheme.
+      "/ws/pty": { target: MAW_HTTP, ws: true, changeOrigin: true },
+      "/ws": { target: MAW_HTTP, ws: true, changeOrigin: true },
     },
   },
 });
